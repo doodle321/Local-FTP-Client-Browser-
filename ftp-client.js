@@ -95,7 +95,7 @@ app.get('/', (req, res) => {
         <aside class="w-full md:w-52 flex flex-row md:flex-col gap-2 shrink-0 overflow-x-auto md:overflow-x-visible pb-2 md:pb-0 select-none">
             <button onclick="document.getElementById('sidebarFileInput').click()" class="flex items-center gap-3 w-full bg-sky-500 hover:bg-sky-600 text-white text-sm font-medium px-4 py-3 rounded-xl transition-all shadow-md shadow-sky-100 shrink-0">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                <span>Upload Tools</span>
+                <span>Upload File</span>
             </button>
             <input type="file" id="sidebarFileInput" class="hidden" multiple onchange="handleFileSelect(this.files)">
 
@@ -103,7 +103,7 @@ app.get('/', (req, res) => {
 
             <button onclick="actionDownloadSelected()" id="toolDownload" disabled class="flex items-center gap-3 w-full border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-white text-slate-700 text-sm font-medium px-4 py-2.5 rounded-xl transition-all shadow-sm shrink-0">
                 <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                <span>Download</span>
+                <span>Download File</span>
             </button>
 
             <button onclick="actionClipboard('cut')" id="toolCut" disabled class="flex items-center gap-3 w-full border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-white text-slate-700 text-sm font-medium px-4 py-2.5 rounded-xl transition-all shadow-sm shrink-0">
