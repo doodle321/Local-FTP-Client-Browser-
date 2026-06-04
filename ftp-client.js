@@ -2,18 +2,56 @@ const express = require('express');
 const { Client } = require('basic-ftp');
 const multer = require('multer');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
-const upload = multer({ storage: multer.memoryStorage() });
+// Use disk storage instead of memory to prevent server crashes on large files
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
-app.use(express.json());
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, uploadDir),
+    filename: (req, file, cb) => {
+        const uniqueName = crypto.randomUUID() + path.extname(file.originalname);
+        cb(null, uniqueName);
+    }
+});
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 5 * 1024 * 1024 * 1024 } // 5GB limit
+});
+
+app.use(express.json({ limit: '10mb' }));
+
+// XSS escape helper
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+// Path sanitization to prevent directory traversal
+function sanitizePath(inputPath) {
+    if (!inputPath || typeof inputPath !== 'string') return '/';
+    // Normalize and prevent traversal
+    let clean = path.posix.normalize(inputPath);
+    // Remove any attempts to go above root
+    while (clean.startsWith('..')) clean = clean.slice(2);
+    while (clean.startsWith('/..')) clean = clean.slice(3);
+    if (!clean.startsWith('/')) clean = '/' + clean;
+    return clean || '/';
+}
 
 // UI Frontend Engine
 app.get('/', (req, res) => {
-    res.send(`
-<!DOCTYPE html>
+    res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -23,6 +61,8 @@ app.get('/', (req, res) => {
     <style>
         .drag-over { background-color: #e0f2fe; border-color: #38bdf8; }
         .selected-row { background-color: #f0f9ff !important; border-left: 4px solid #38bdf8; }
+        .sort-asc::after { content: " ▲"; }
+        .sort-desc::after { content: " ▼"; }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-800 font-sans h-screen flex flex-col overflow-hidden">
@@ -39,6 +79,18 @@ app.get('/', (req, res) => {
                     <label class="text-xs font-semibold uppercase text-slate-500">Port</label>
                     <input type="number" id="ftpPort" value="21" class="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:border-sky-500">
                 </div>
+                <div>
+                    <label class="text-xs font-semibold uppercase text-slate-500">Username</label>
+                    <input type="text" id="ftpUser" value="anonymous" class="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:border-sky-500">
+                </div>
+                <div>
+                    <label class="text-xs font-semibold uppercase text-slate-500">Password</label>
+                    <input type="password" id="ftpPass" placeholder="Leave empty for anonymous" class="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:border-sky-500">
+                </div>
+                <div class="flex items-center gap-2">
+                    <input type="checkbox" id="ftpSecure" class="rounded border-slate-300 text-sky-500 focus:ring-sky-400">
+                    <label for="ftpSecure" class="text-sm text-slate-600">Use FTPS (TLS)</label>
+                </div>
                 <button onclick="saveAndConnect()" class="w-full bg-sky-500 text-white font-medium py-2 rounded-lg hover:bg-sky-600 transition-colors mt-2">Connect</button>
             </div>
         </div>
@@ -50,11 +102,22 @@ app.get('/', (req, res) => {
                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
                 <h3 class="text-lg font-bold text-slate-900">File Already Exists</h3>
             </div>
-            <p id="collisionMessage" class="text-sm text-slate-600 mb-5 break-all">A destination asset match was discovered.</p>
+            <p id="collisionMessage" class="text-sm text-slate-600 mb-5 break-all"></p>
             <div class="flex flex-col sm:flex-row justify-end gap-2 text-sm font-medium">
                 <button id="btnSkip" class="px-4 py-2 border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50 transition-colors">Don't Copy</button>
                 <button id="btnKeepBoth" class="px-4 py-2 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 transition-colors">Keep Both</button>
                 <button id="btnReplace" class="px-4 py-2 bg-sky-500 text-white rounded-lg hover:bg-sky-600 transition-colors">Replace</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="renameModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm hidden flex items-center justify-center z-50 p-4">
+        <div class="bg-white p-6 rounded-2xl shadow-xl w-full max-w-sm border border-slate-100">
+            <h3 class="text-lg font-bold text-slate-900 mb-3">Rename Item</h3>
+            <input type="text" id="renameInput" class="w-full px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:border-sky-500 mb-4">
+            <div class="flex justify-end gap-2">
+                <button onclick="closeRenameModal()" class="px-4 py-2 border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50">Cancel</button>
+                <button onclick="confirmRename()" class="px-4 py-2 bg-sky-500 text-white rounded-lg hover:bg-sky-600">Rename</button>
             </div>
         </div>
     </div>
@@ -72,7 +135,9 @@ app.get('/', (req, res) => {
             </div>
             <div class="flex items-center gap-2">
                 <button onclick="triggerNewFolder()" class="bg-white border border-slate-200 hover:border-slate-300 text-slate-700 px-4 py-2 rounded-lg text-sm font-medium transition-all shadow-sm">New Folder</button>
-                <button onclick="showConnectionPrompt()" class="p-2 text-slate-400 hover:text-slate-600 rounded-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg></button>
+                <button onclick="showConnectionPrompt()" class="p-2 text-slate-400 hover:text-slate-600 rounded-lg" title="Connection Settings">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                </button>
             </div>
         </div>
     </header>
@@ -121,6 +186,11 @@ app.get('/', (req, res) => {
                 <span>Paste Here</span>
             </button>
 
+            <button onclick="actionRenameSelected()" id="toolRename" disabled class="flex items-center gap-3 w-full border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 disabled:hover:bg-white text-slate-700 text-sm font-medium px-4 py-2.5 rounded-xl transition-all shadow-sm shrink-0">
+                <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                <span>Rename</span>
+            </button>
+
             <button onclick="actionDeleteSelected()" id="toolDelete" disabled class="flex items-center gap-3 w-full border border-red-200 bg-white hover:bg-red-50 disabled:opacity-40 disabled:hover:bg-white text-red-600 text-sm font-medium px-4 py-2.5 rounded-xl transition-all shadow-sm shrink-0">
                 <svg class="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-4v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                 <span>Delete</span>
@@ -133,6 +203,7 @@ app.get('/', (req, res) => {
                 <button onclick="selectAllItems()" class="px-2 py-1 bg-white border border-slate-200 rounded hover:bg-slate-50 text-slate-600 font-medium shadow-sm">Select All</button>
                 <button onclick="deselectAllItems()" class="px-2 py-1 bg-white border border-slate-200 rounded hover:bg-slate-50 text-slate-600 font-medium shadow-sm">Deselect All</button>
                 <button onclick="invertSelection()" class="px-2 py-1 bg-white border border-slate-200 rounded hover:bg-slate-50 text-slate-600 font-medium shadow-sm">Invert Selection</button>
+                <span id="selectionInfo" class="ml-auto text-slate-400 font-medium"></span>
             </div>
 
             <div class="flex-1 overflow-y-auto min-h-0" id="fileListBox">
@@ -140,8 +211,9 @@ app.get('/', (req, res) => {
                     <thead class="sticky top-0 bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider select-none z-10">
                         <tr>
                             <th class="py-3 px-4 w-10"></th>
-                            <th class="py-3 px-2">Name</th>
-                            <th class="py-3 px-6 text-right w-32">Size</th>
+                            <th class="py-3 px-2 cursor-pointer hover:text-slate-700" onclick="sortFiles('name')">Name</th>
+                            <th class="py-3 px-6 text-right w-32 cursor-pointer hover:text-slate-700" onclick="sortFiles('size')">Size</th>
+                            <th class="py-3 px-6 text-right w-40 cursor-pointer hover:text-slate-700" onclick="sortFiles('date')">Modified</th>
                         </tr>
                     </thead>
                     <tbody id="fileList" class="divide-y divide-slate-100 text-sm"></tbody>
@@ -179,6 +251,9 @@ app.get('/', (req, res) => {
         let directoryItems = []; 
         let selectedNames = new Set(); 
         let clipboard = { action: null, items: [], sourceDir: null };
+        let sortColumn = 'name';
+        let sortDirection = 'asc';
+        let renameTarget = null;
         
         let transferStartTime = null;
         let lastLoadedBytes = 0;
@@ -234,12 +309,14 @@ app.get('/', (req, res) => {
         window.onload = async function() {
             let savedIp = localStorage.getItem('ftp_ip');
             let savedPort = localStorage.getItem('ftp_port') || '21';
+            let savedUser = localStorage.getItem('ftp_user') || 'anonymous';
             
             if (savedIp) {
                 document.getElementById('ftpIp').value = savedIp;
                 document.getElementById('ftpPort').value = savedPort;
+                document.getElementById('ftpUser').value = savedUser;
                 
-                let success = await testConnection(savedIp, savedPort);
+                let success = await testConnection(savedIp, savedPort, savedUser, localStorage.getItem('ftp_pass') || '', localStorage.getItem('ftp_secure') === 'true');
                 if (success) {
                     loadDirectory();
                     return;
@@ -248,16 +325,16 @@ app.get('/', (req, res) => {
             showConnectionPrompt();
         };
 
-        async function testConnection(ip, port) {
+        async function testConnection(ip, port, user, pass, secure) {
             document.getElementById('connectionStatus').innerText = "Connecting...";
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 3000);
+            const timeoutId = setTimeout(() => controller.abort(), 5000);
 
             try {
                 const response = await fetch('/api/connect', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ip, port }),
+                    body: JSON.stringify({ ip, port: parseInt(port), user, pass, secure }),
                     signal: controller.signal
                 });
                 clearTimeout(timeoutId);
@@ -266,27 +343,36 @@ app.get('/', (req, res) => {
                     document.getElementById('connectionStatus').innerText = "Connected to " + ip + ":" + port;
                     return true;
                 }
+                document.getElementById('connectionStatus').innerText = "Connection failed";
                 return false;
             } catch (err) {
+                document.getElementById('connectionStatus').innerText = "Connection timeout";
                 return false;
             }
         }
 
-        // Exposing globally to clear manual modal lockouts
         window.showConnectionPrompt = function() { 
             modal.classList.remove('hidden'); 
         };
 
         async function saveAndConnect() {
-            let ip = document.getElementById('ftpIp').value;
+            let ip = document.getElementById('ftpIp').value.trim();
             let port = document.getElementById('ftpPort').value;
+            let user = document.getElementById('ftpUser').value.trim() || 'anonymous';
+            let pass = document.getElementById('ftpPass').value;
+            let secure = document.getElementById('ftpSecure').checked;
+            
             if(!ip) return alert("IP is required");
             
             modal.classList.add('hidden');
-            let success = await testConnection(ip, port);
+            let success = await testConnection(ip, port, user, pass, secure);
             if(success) {
                 localStorage.setItem('ftp_ip', ip);
                 localStorage.setItem('ftp_port', port);
+                localStorage.setItem('ftp_user', user);
+                if(pass) localStorage.setItem('ftp_pass', pass);
+                else localStorage.removeItem('ftp_pass');
+                localStorage.setItem('ftp_secure', secure);
                 currentPath = '/'; 
                 loadDirectory();
             } else {
@@ -341,26 +427,59 @@ app.get('/', (req, res) => {
                 let data = await response.json();
                 if (data.success) {
                     directoryItems = data.files || [];
+                    sortFiles(null); // Apply current sort
                     renderFiles();
                     renderBreadcrumbs();
                 } else {
-                    alert("Error reading path: " + data.error);
+                    alert("Error reading path: " + (data.error || 'Unknown error'));
                 }
             } catch (err) {
                 console.error(err);
+                alert("Failed to load directory");
             }
         }
 
-                function renderFiles() {
+        function sortFiles(column) {
+            if (column) {
+                if (sortColumn === column) {
+                    sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortColumn = column;
+                    sortDirection = 'asc';
+                }
+            }
+            
+            directoryItems.sort((a, b) => {
+                // Directories always first
+                if (a.type !== b.type) return a.type === 'd' ? -1 : 1;
+                
+                let cmp = 0;
+                if (sortColumn === 'name') {
+                    cmp = a.name.localeCompare(b.name);
+                } else if (sortColumn === 'size') {
+                    cmp = (a.size || 0) - (b.size || 0);
+                } else if (sortColumn === 'date') {
+                    cmp = (a.rawModifiedAt || 0) - (b.rawModifiedAt || 0);
+                }
+                
+                return sortDirection === 'asc' ? cmp : -cmp;
+            });
+            
+            renderFiles();
+        }
+
+        function renderFiles() {
             const tbody = document.getElementById('fileList');
             const emptyState = document.getElementById('emptyState');
             tbody.innerHTML = '';
             
             if(directoryItems.length === 0) {
                 emptyState.classList.remove('hidden');
+                document.getElementById('selectionInfo').innerText = '';
                 return;
             }
             emptyState.classList.add('hidden');
+            document.getElementById('selectionInfo').innerText = directoryItems.length + ' items';
 
             directoryItems.forEach(file => {
                 const tr = document.createElement('tr');
@@ -368,28 +487,29 @@ app.get('/', (req, res) => {
                 tr.className = "hover:bg-slate-50/50 transition-all cursor-pointer select-none border-l-4 " + (isSelected ? 'selected-row' : 'border-transparent');
                 
                 const sizeStr = file.type === 'd' ? '--' : formatBytes(file.size);
+                const dateStr = file.modifiedAt ? new Date(file.modifiedAt).toLocaleString() : '--';
                 const icon = file.type === 'd' 
                     ? '<svg class="w-5 h-5 text-sky-400 fill-sky-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"></path></svg>'
                     : '<svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg>';
 
-                // Cleaned up string construction to prevent SyntaxErrors
-                let rowHtml = "";
-                rowHtml += '<td class="py-3 px-4 text-center" onclick="event.stopPropagation();">';
-                rowHtml += '  <input type="checkbox" class="rounded border-slate-300 text-sky-500 focus:ring-sky-400 w-4 h-4 cursor-pointer" ' + (isSelected ? 'checked' : '') + '>';
-                rowHtml += '</td>';
-                rowHtml += '<td class="py-3 px-2 font-medium text-slate-700 flex items-center gap-3">';
-                rowHtml += '  ' + icon;
-                rowHtml += '  <span class="item-name-text hover:text-sky-600 transition-colors">' + file.name + '</span>';
-                rowHtml += '</td>';
-                rowHtml += '<td class="py-3 px-6 text-slate-400 text-right">' + sizeStr + '</td>';
+                const safeName = escapeHtml(file.name);
                 
-                tr.innerHTML = rowHtml;
+                tr.innerHTML = 
+                    '<td class="py-3 px-4 text-center" onclick="event.stopPropagation();">' +
+                    '  <input type="checkbox" class="rounded border-slate-300 text-sky-500 focus:ring-sky-400 w-4 h-4 cursor-pointer" ' + (isSelected ? 'checked' : '') + '>' +
+                    '</td>' +
+                    '<td class="py-3 px-2 font-medium text-slate-700 flex items-center gap-3">' +
+                    '  ' + icon +
+                    '  <span class="item-name-text hover:text-sky-600 transition-colors truncate max-w-[200px] sm:max-w-xs" title="' + safeName + '">' + safeName + '</span>' +
+                    '</td>' +
+                    '<td class="py-3 px-6 text-slate-400 text-right whitespace-nowrap">' + sizeStr + '</td>' +
+                    '<td class="py-3 px-6 text-slate-400 text-right whitespace-nowrap text-xs">' + dateStr + '</td>';
 
                 const checkbox = tr.querySelector('input[type="checkbox"]');
                 checkbox.onchange = (e) => {
                     if (checkbox.checked) selectedNames.add(file.name);
                     else selectedNames.delete(file.name);
-                    renderFiles();
+                    updateRowSelection(tr, file.name);
                     updateSidebarState();
                 };
 
@@ -401,7 +521,7 @@ app.get('/', (req, res) => {
                         selectedNames.clear();
                         selectedNames.add(file.name);
                     }
-                    renderFiles();
+                    renderFiles(); // Re-render to update all rows
                     updateSidebarState();
                 };
 
@@ -416,6 +536,15 @@ app.get('/', (req, res) => {
             });
         }
 
+        function updateRowSelection(row, name) {
+            if (selectedNames.has(name)) {
+                row.classList.add('selected-row');
+                row.classList.remove('border-transparent');
+            } else {
+                row.classList.remove('selected-row');
+                row.classList.add('border-transparent');
+            }
+        }
 
         function selectAllItems() {
             directoryItems.forEach(f => selectedNames.add(f.name));
@@ -440,13 +569,19 @@ app.get('/', (req, res) => {
 
         function updateSidebarState() {
             const hasSelection = selectedNames.size > 0;
+            const singleSelected = selectedNames.size === 1;
             const singleFileSelected = selectedNames.size === 1 && directoryItems.find(f => selectedNames.has(f.name) && f.type !== 'd');
 
             document.getElementById('toolDownload').disabled = !singleFileSelected;
             document.getElementById('toolCut').disabled = !hasSelection;
             document.getElementById('toolCopy').disabled = !hasSelection;
             document.getElementById('toolDelete').disabled = !hasSelection;
+            document.getElementById('toolRename').disabled = !singleSelected;
             document.getElementById('toolPaste').disabled = clipboard.items.length === 0;
+            
+            document.getElementById('selectionInfo').innerText = selectedNames.size > 0 
+                ? selectedNames.size + ' of ' + directoryItems.length + ' selected' 
+                : directoryItems.length + ' items';
         }
 
         function startHUD(actionType, filename) {
@@ -498,7 +633,7 @@ app.get('/', (req, res) => {
             setTimeout(() => {
                 const hud = document.getElementById('progressHUD');
                 hud.classList.add('opacity-0', 'translate-y-20', 'pointer-events-none');
-            }, 1000);
+            }, 1200);
         }
 
         function checkCollisionPrompt(filename) {
@@ -509,7 +644,7 @@ app.get('/', (req, res) => {
                     return;
                 }
 
-                document.getElementById('collisionMessage').innerText = "The current directory already contains a file named \\"" + filename + "\\". What would you like to do?";
+                document.getElementById('collisionMessage').innerText = 'The current directory already contains a file named "' + filename + '". What would you like to do?';
                 const cModal = document.getElementById('collisionModal');
                 cModal.classList.remove('hidden');
 
@@ -525,9 +660,13 @@ app.get('/', (req, res) => {
 
                 document.getElementById('btnKeepBoth').onclick = () => {
                     cModal.classList.add('hidden');
-                    let ext = filename.substring(filename.lastIndexOf('.'));
-                    let base = filename.substring(0, filename.lastIndexOf('.'));
-                    if(filename.indexOf('.') === -1) { base = filename; ext = ''; }
+                    let ext = '';
+                    let base = filename;
+                    const lastDot = filename.lastIndexOf('.');
+                    if (lastDot > 0) {
+                        ext = filename.substring(lastDot);
+                        base = filename.substring(0, lastDot);
+                    }
                     
                     let counter = 1;
                     let candidateName = base + "_" + counter + ext;
@@ -544,7 +683,7 @@ app.get('/', (req, res) => {
             if(selectedNames.size === 0) return;
             const targetItems = directoryItems.filter(f => selectedNames.has(f.name));
             clipboard = { action: type, items: targetItems, sourceDir: currentPath };
-            document.getElementById('connectionStatus').innerText = "Staged " + clipboard.items.length + " assets for transfer pipeline.";
+            document.getElementById('connectionStatus').innerText = "Staged " + clipboard.items.length + " item(s) for " + type;
             updateSidebarState();
         }
 
@@ -561,24 +700,20 @@ app.get('/', (req, res) => {
                 startHUD(clipboard.action === 'cut' ? "Moving" : "Copying", promptResult.customName);
 
                 try {
-                    let simulatedProgress = 0;
-                    const interval = setInterval(() => {
-                        simulatedProgress += (item.size * 0.15);
-                        if(simulatedProgress >= item.size) simulatedProgress = item.size * 0.98;
-                        updateHUD(simulatedProgress, item.size);
-                    }, 250);
-
                     let res = await fetch('/api/clipboard/paste', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ action: clipboard.action, sourcePath: sPath, targetPath: tPath })
                     });
                     
-                    clearInterval(interval);
-                    updateHUD(item.size, item.size);
-                    await res.json();
+                    let data = await res.json();
+                    if (!data.success) {
+                        alert("Transfer failed: " + (data.error || 'Unknown error'));
+                    }
+                    updateHUD(item.size || 1, item.size || 1);
                 } catch(err) {
                     console.error(err);
+                    alert("Network error during transfer");
                 } finally {
                     closeHUD();
                 }
@@ -590,16 +725,20 @@ app.get('/', (req, res) => {
 
         async function actionDeleteSelected() {
             if(selectedNames.size === 0) return;
-            if(!confirm("Permanently delete " + selectedNames.size + " items?")) return;
+            if(!confirm("Permanently delete " + selectedNames.size + " item(s)? This cannot be undone.")) return;
 
             const targets = Array.from(selectedNames);
             for(const name of targets) {
                 const fullPath = currentPath.endsWith('/') ? currentPath + name : currentPath + '/' + name;
-                await fetch('/api/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: fullPath })
-                });
+                try {
+                    await fetch('/api/delete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: fullPath })
+                    });
+                } catch (err) {
+                    console.error("Delete failed for", name, err);
+                }
             }
             loadDirectory();
         }
@@ -614,29 +753,79 @@ app.get('/', (req, res) => {
             
             startHUD("Downloading", name);
 
-            const xhr = new XMLHttpRequest();
-            xhr.open('GET', "/api/download?path=" + encodeURIComponent(fullPath), true);
-            xhr.responseType = 'blob';
-
-            xhr.onprogress = (e) => {
-                if (e.lengthComputable) updateHUD(e.loaded, e.total);
-                else updateHUD(e.loaded, targetItem.size);
-            };
-
-            xhr.onload = () => {
-                if (xhr.status === 200) {
-                    updateHUD(targetItem.size, targetItem.size);
-                    const blob = xhr.response;
-                    const link = document.createElement('a');
-                    link.href = window.URL.createObjectURL(blob);
-                    link.download = name;
-                    link.click();
-                } else {
-                    alert("Download channel exception");
+            try {
+                const response = await fetch("/api/download?path=" + encodeURIComponent(fullPath));
+                if (!response.ok) throw new Error("Download failed");
+                
+                const contentLength = response.headers.get('content-length');
+                const total = contentLength ? parseInt(contentLength) : targetItem.size;
+                
+                const reader = response.body.getReader();
+                const chunks = [];
+                let received = 0;
+                
+                while(true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    chunks.push(value);
+                    received += value.length;
+                    updateHUD(received, total);
                 }
+                
+                const blob = new Blob(chunks);
+                const link = document.createElement('a');
+                link.href = window.URL.createObjectURL(blob);
+                link.download = name;
+                link.click();
+                window.URL.revokeObjectURL(link.href);
+                
+            } catch (err) {
+                alert("Download failed: " + err.message);
+            } finally {
                 closeHUD();
-            };
-            xhr.send();
+            }
+        }
+
+        function actionRenameSelected() {
+            if (selectedNames.size !== 1) return;
+            renameTarget = Array.from(selectedNames)[0];
+            document.getElementById('renameInput').value = renameTarget;
+            document.getElementById('renameModal').classList.remove('hidden');
+            setTimeout(() => document.getElementById('renameInput').focus(), 100);
+        }
+
+        function closeRenameModal() {
+            document.getElementById('renameModal').classList.add('hidden');
+            renameTarget = null;
+        }
+
+        async function confirmRename() {
+            if (!renameTarget) return;
+            const newName = document.getElementById('renameInput').value.trim();
+            if (!newName || newName === renameTarget) {
+                closeRenameModal();
+                return;
+            }
+            
+            const oldPath = currentPath.endsWith('/') ? currentPath + renameTarget : currentPath + '/' + renameTarget;
+            const newPath = currentPath.endsWith('/') ? currentPath + newName : currentPath + '/' + newName;
+            
+            try {
+                let res = await fetch('/api/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ oldPath, newPath })
+                });
+                let data = await res.json();
+                if (data.success) {
+                    loadDirectory();
+                } else {
+                    alert("Rename failed: " + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                alert("Rename failed: " + err.message);
+            }
+            closeRenameModal();
         }
 
         function navigateTo(targetPath) {
@@ -656,19 +845,20 @@ app.get('/', (req, res) => {
             const container = document.getElementById('breadcrumbs');
             const backBtn = document.getElementById('backBtn');
             backBtn.disabled = (currentPath === '/');
-            container.innerHTML = '<span class="cursor-pointer text-sky-500 font-medium shrink-0" onclick="navigateTo(\'/\'); event.stopPropagation();">Root</span>';
+            container.innerHTML = '<span class="cursor-pointer text-sky-500 font-medium shrink-0" onclick="navigateTo(\\'/\\'); event.stopPropagation();">Root</span>';
             
             const parts = currentPath.split('/').filter(p => p);
             let builtPath = '';
             parts.forEach((part, index) => {
                 builtPath += '/' + part;
                 const isLast = index === parts.length - 1;
-                container.innerHTML += " <span class=\\"text-slate-300 shrink-0\\">/</span> ";
+                const safePart = escapeHtml(part);
+                container.innerHTML += ' <span class="text-slate-300 shrink-0">/</span> ';
                 if(isLast) {
-                    container.innerHTML += "<span class=\\"text-slate-700 font-medium truncate\\">" + part + "</span>";
+                    container.innerHTML += '<span class="text-slate-700 font-medium truncate">' + safePart + '</span>';
                 } else {
                     const currentTargetMap = builtPath;
-                    container.innerHTML += "<span class=\\"cursor-pointer text-sky-500 font-medium shrink-0\\" onclick=\\"navigateTo('" + currentTargetMap.replace(/'/g, "\\\\'") + "'); event.stopPropagation();\\">" + part + "</span>";
+                    container.innerHTML += '<span class="cursor-pointer text-sky-500 font-medium shrink-0" onclick="navigateTo(\\'' + currentTargetMap.replace(/\\\\/g, '\\\\\\\\').replace(/\\'/g, '\\\\\\'') + '\\'); event.stopPropagation();">' + safePart + '</span>';
                 }
             });
         }
@@ -676,15 +866,27 @@ app.get('/', (req, res) => {
         async function triggerNewFolder() {
             let folderName = prompt("Enter new folder name:");
             if(!folderName) return;
+            // Basic sanitization
+            folderName = folderName.replace(/[\\\\/:*?"<>|]/g, '');
+            if(!folderName) return alert("Invalid folder name");
+            
             let target = currentPath.endsWith('/') ? currentPath + folderName : currentPath + '/' + folderName;
             
-            let response = await fetch('/api/mkdir', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ path: target })
-            });
-            let data = await response.json();
-            if(data.success) loadDirectory();
+            try {
+                let response = await fetch('/api/mkdir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: target })
+                });
+                let data = await response.json();
+                if(data.success) {
+                    loadDirectory();
+                } else {
+                    alert("Failed to create folder: " + (data.error || 'Unknown error'));
+                }
+            } catch (err) {
+                alert("Failed to create folder");
+            }
         }
 
         async function handleFileSelect(files) {
@@ -703,21 +905,23 @@ app.get('/', (req, res) => {
                 formData.append('file', file);
                 formData.append('remotePath', target);
 
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', '/api/upload', true);
-
-                xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) updateHUD(e.loaded, e.total);
-                };
-
-                await new Promise((resolve) => {
-                    xhr.onload = () => {
-                        updateHUD(file.size, file.size);
-                        resolve();
-                    };
-                    xhr.send(formData);
-                });
-                closeHUD();
+                try {
+                    const response = await fetch('/api/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (!response.ok) {
+                        const err = await response.json();
+                        alert("Upload failed: " + (err.error || 'Unknown error'));
+                    }
+                    updateHUD(file.size, file.size);
+                } catch(err) {
+                    console.error(err);
+                    alert("Upload failed: Network error");
+                } finally {
+                    closeHUD();
+                }
             }
             loadDirectory();
         }
@@ -730,27 +934,44 @@ app.get('/', (req, res) => {
             const i = Math.floor(Math.log(bytes) / Math.log(k));
             return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + " " + sizes[i];
         }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
     </script>
 </body>
-</html>
-    `);
+</html>`);
 });
 
-let ftpConfig = { host: '', port: 21 };
+let ftpConfig = { host: '', port: 21, user: 'anonymous', password: '', secure: false };
 
 app.post('/api/connect', async (req, res) => {
-    const { ip, port } = req.body;
+    const { ip, port, user, pass, secure } = req.body;
+    if (!ip) return res.status(400).json({ success: false, error: 'IP address required' });
+    
     const client = new Client();
     try {
-        // Enforce 3-second connection fallback threshold explicitly
         await client.access({ 
             host: ip, 
-            port: parseInt(port), 
-            user: "anonymous", 
-            password: "",
-            timeout: 3000 
+            port: parseInt(port) || 21, 
+            user: user || 'anonymous', 
+            password: pass || '',
+            secure: secure || false,
+            timeout: 5000 
         });
-        ftpConfig = { host: ip, port: parseInt(port) };
+        ftpConfig = { 
+            host: ip, 
+            port: parseInt(port) || 21, 
+            user: user || 'anonymous', 
+            password: pass || '',
+            secure: secure || false
+        };
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
@@ -760,15 +981,17 @@ app.post('/api/connect', async (req, res) => {
 });
 
 app.get('/api/list', async (req, res) => {
-    const remotePath = req.query.path || '/';
+    const remotePath = sanitizePath(req.query.path);
     const client = new Client();
     try {
-        await client.access({ ...ftpConfig, user: "anonymous", timeout: 3000 });
+        await client.access({ ...ftpConfig, timeout: 10000 });
         const rawList = await client.list(remotePath);
         const cleanFiles = rawList.map(f => ({
             name: f.name,
             size: f.size,
-            type: f.isDirectory ? 'd' : 'f'
+            type: f.isDirectory ? 'd' : 'f',
+            modifiedAt: f.modifiedAt ? f.modifiedAt.toISOString() : null,
+            rawModifiedAt: f.modifiedAt ? f.modifiedAt.getTime() : 0
         })).filter(f => f.name !== '.' && f.name !== '..');
         res.json({ success: true, files: cleanFiles });
     } catch (err) {
@@ -779,15 +1002,21 @@ app.get('/api/list', async (req, res) => {
 });
 
 app.get('/api/download', async (req, res) => {
-    const remotePath = req.query.path;
+    const remotePath = sanitizePath(req.query.path);
     const client = new Client();
     try {
-        await client.access({ ...ftpConfig, user: "anonymous" });
+        await client.access(ftpConfig);
         res.setHeader('Content-Disposition', `attachment; filename="${path.basename(remotePath)}"`);
-        await client.downloadTo({ write: (chunk, enc, cb) => { res.write(chunk, enc, cb); } }, remotePath);
-        res.end();
+        res.setHeader('Content-Type', 'application/octet-stream');
+        
+        await client.downloadTo(res, remotePath);
+        // Express response will be ended by the stream
     } catch (err) {
-        if (!res.headersSent) res.status(500).send(err.message);
+        if (!res.headersSent) {
+            res.status(500).json({ success: false, error: err.message });
+        } else {
+            res.destroy();
+        }
     } finally {
         client.close();
     }
@@ -797,15 +1026,22 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const { remotePath } = req.body;
     const client = new Client();
     try {
-        await client.access({ ...ftpConfig, user: "anonymous" });
-        const Readable = require('stream').Readable;
-        const stream = new Readable();
-        stream.push(req.file.buffer);
-        stream.push(null);
-
-        await client.uploadFrom(stream, remotePath);
+        await client.access(ftpConfig);
+        const localPath = req.file.path;
+        
+        await client.uploadFrom(localPath, sanitizePath(remotePath));
+        
+        // Clean up temp file
+        fs.unlink(localPath, (err) => {
+            if (err) console.error('Failed to clean up temp file:', err);
+        });
+        
         res.json({ success: true });
     } catch (err) {
+        // Clean up on error too
+        if (req.file && req.file.path) {
+            fs.unlink(req.file.path, () => {});
+        }
         res.status(500).json({ success: false, error: err.message });
     } finally {
         client.close();
@@ -813,11 +1049,11 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 });
 
 app.post('/api/mkdir', async (req, res) => {
-    const { path } = req.body;
+    const { path: dirPath } = req.body;
     const client = new Client();
     try {
-        await client.access({ ...ftpConfig, user: "anonymous" });
-        await client.send(`MKD ${path}`);
+        await client.access(ftpConfig);
+        await client.ensureDir(sanitizePath(dirPath));
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
@@ -827,20 +1063,43 @@ app.post('/api/mkdir', async (req, res) => {
 });
 
 app.post('/api/delete', async (req, res) => {
-    const { path } = req.body;
+    const { path: itemPath } = req.body;
     const client = new Client();
     try {
-        await client.access({ ...ftpConfig, user: "anonymous" });
-        const targetDirname = path.substring(0, path.lastIndexOf('/')) || '/';
-        const targetFilename = path.substring(path.lastIndexOf('/') + 1);
-        const list = await client.list(targetDirname);
-        const item = list.find(f => f.name === targetFilename);
-
-        if (item && item.isDirectory) {
-            await client.removeDir(path);
-        } else {
-            await client.remove(path);
+        await client.access(ftpConfig);
+        const sanitized = sanitizePath(itemPath);
+        const targetDirname = sanitized.substring(0, sanitized.lastIndexOf('/')) || '/';
+        const targetFilename = sanitized.substring(sanitized.lastIndexOf('/') + 1);
+        
+        // Try to list parent to determine if directory
+        let isDir = false;
+        try {
+            const list = await client.list(targetDirname);
+            const item = list.find(f => f.name === targetFilename);
+            isDir = item && item.isDirectory;
+        } catch (e) {
+            // If we can't list, try remove as file first
         }
+
+        if (isDir) {
+            await client.removeDir(sanitized);
+        } else {
+            await client.remove(sanitized);
+        }
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    } finally {
+        client.close();
+    }
+});
+
+app.post('/api/rename', async (req, res) => {
+    const { oldPath, newPath } = req.body;
+    const client = new Client();
+    try {
+        await client.access(ftpConfig);
+        await client.rename(sanitizePath(oldPath), sanitizePath(newPath));
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
@@ -851,39 +1110,46 @@ app.post('/api/delete', async (req, res) => {
 
 app.post('/api/clipboard/paste', async (req, res) => {
     const { action, sourcePath, targetPath } = req.body;
-    const clientReader = new Client();
-    const clientWriter = new Client();
+    const client = new Client();
     
     try {
-        await clientReader.access({ ...ftpConfig, user: "anonymous" });
-        await clientWriter.access({ ...ftpConfig, user: "anonymous" });
+        await client.access(ftpConfig);
         
-        const PassThrough = require('stream').PassThrough;
-        const bridgeStream = new PassThrough();
-
-        const downloadPromise = clientReader.downloadTo(bridgeStream, sourcePath);
-        const uploadPromise = clientWriter.uploadFrom(bridgeStream, targetPath);
-
-        await Promise.all([downloadPromise, uploadPromise]);
-
+        // Use FTP's native rename for same-server moves (instant, no data transfer)
         if (action === 'cut') {
-            const list = await clientReader.list(sourcePath.substring(0, sourcePath.lastIndexOf('/')) || '/');
-            const item = list.find(f => f.name === sourcePath.substring(sourcePath.lastIndexOf('/') + 1));
-            if (item && item.isDirectory) {
-                await clientReader.removeDir(sourcePath);
-            } else {
-                await clientReader.remove(sourcePath);
-            }
+            await client.rename(sanitizePath(sourcePath), sanitizePath(targetPath));
+            res.json({ success: true });
+            return;
         }
+        
+        // For copy, we need to download then upload
+        const tempFile = path.join(uploadDir, crypto.randomUUID() + '.tmp');
+        
+        // Download to temp file
+        await client.downloadTo(tempFile, sanitizePath(sourcePath));
+        
+        // Upload from temp file
+        await client.uploadFrom(tempFile, sanitizePath(targetPath));
+        
+        // Clean up temp
+        fs.unlink(tempFile, (err) => {
+            if (err) console.error('Failed to clean up temp file:', err);
+        });
+        
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     } finally {
-        clientReader.close();
-        clientWriter.close();
+        client.close();
     }
 });
 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'ok', ftpConfigured: !!ftpConfig.host });
+});
+
 app.listen(port, '0.0.0.0', () => {
-    console.log(`Server listening on port ${port}`);
+    console.log(`LAN FTP Client listening on port ${port}`);
+    console.log(`Open http://localhost:${port} in your browser`);
 });
