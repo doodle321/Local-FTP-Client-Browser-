@@ -17,7 +17,7 @@ To run this application, you need to have Node.js and npm installed on your syst
 ### 2. Set Up the Project
 Clone or download this repository, navigate to the project folder, and initialize it:
 ```
-  git clone https://github.com/doodle321/Local-FTP-client_Browser.git
+  git clone https://github.com/doodle321/Local-FTP-client_Browser-.git
   cd Local-FTP-client_Browser/
   npm init -y
 ```
